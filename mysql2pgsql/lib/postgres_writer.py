@@ -1,11 +1,13 @@
 from __future__ import absolute_import
 
 import re
+import sys
 from cStringIO import StringIO
 from datetime import datetime, date, timedelta
 
 from psycopg2.extensions import QuotedString, Binary, AsIs
 from pytz import timezone
+from django.contrib.gis.geos import GEOSGeometry, WKBWriter
 
 
 class PostgresWriter(object):
@@ -42,7 +44,6 @@ class PostgresWriter(object):
             """
             t = lambda v: not v == None
             default = (' DEFAULT %s' % QuotedString(column['default']).getquoted()) if t(column['default']) else None
-
             if column['type'] == 'char':
                 default = ('%s::char' % default) if t(default) else None
                 return default, 'character(%s)' % column['length']
@@ -120,6 +121,10 @@ class PostgresWriter(object):
                 if default:
                     default = ' DEFAULT ARRAY[%s]::text[]' % ','.join(QuotedString(v).getquoted() for v in re.search(r"'(.*)'", default).group(1).split(','))
                 return default, 'text[]'
+            elif column['type'] == 'point':
+                return default, 'GEOGRAPHY(POINT,4326)'
+            elif column['type'] == 'polygon':
+                return default, 'GEOGRAPHY(POLYGON,4326)'
             else:
                 raise Exception('unknown %s' % column['type'])
 
@@ -139,8 +144,12 @@ class PostgresWriter(object):
         for index, column in enumerate(table.columns):
             hash_key = hash(frozenset(column.items()))
             column_type = self.column_types[hash_key] if hash_key in self.column_types else self.column_type(column)
+            
             if row[index] == None and ('timestamp' not in column_type or not column['default']):
                 row[index] = '\N'
+            elif column_type.startswith('GEOGRAPHY'):
+                geo = GEOSGeometry(buffer(row[index][4:]))
+                row[index] = WKBWriter().write_hex(geo) 
             elif row[index] == None and column['default']:
                 if self.tz:
                     row[index] = '1970-01-01T00:00:00.000000' + self.tz_offset
@@ -237,15 +246,20 @@ class PostgresWriter(object):
             if 'primary' in index:
                 continue
             unique = 'UNIQUE ' if index.get('unique', None) else ''
-            index_name = '%s_%s' % (table.name, '_'.join(index['columns']))
+            index_name = '%s_%s_idx' % (table.name, '_'.join(index['columns']))
             index_sql.append('DROP INDEX IF EXISTS "%s" CASCADE;' % index_name)
-            index_sql.append('CREATE %(unique)sINDEX "%(index_name)s" ON "%(table_name)s" (%(column_names)s);' % {
+            using = ''
+            for column in table.columns:
+                if column['name'] in index['columns']:
+                    if column['type'] in ['polygon', 'point']:
+                        using = 'USING GIST'
+            index_sql.append('CREATE %(unique)sINDEX "%(index_name)s" ON "%(table_name)s" %(using)s (%(column_names)s);' % {
                     'unique': unique,
                     'index_name': index_name,
                     'table_name': table.name,
+                    'using': using,
                     'column_names': ', '.join('"%s"' % col for col in index['columns']),
                     })
-
         return index_sql
 
     def write_constraints(self, table):
